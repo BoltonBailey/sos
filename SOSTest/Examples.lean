@@ -132,6 +132,18 @@ example (x : ℝ) (_h : x < 1) : 0 ≤ 1 - x := by sos
 -- Strict variable-vs-variable form: `h : x < y → 0 ≤ y − x`.
 example (x y : ℝ) (_h : x < y) : 0 ≤ y - x := by sos
 
+-- A hard high-degree Putinar problem (Isabelle's `Sum_of_Squares`
+-- proves it; this repo used to fail). The rounder needs the
+-- Peyrl–Parrilo affine projection: the converged CSDP Gram is
+-- irrational, and only projecting the rounded matrices back onto the
+-- exact coefficient-matching set recovers a certificate. Also exercises
+-- `multiplierBasisDeg`'s floored relaxation degree — with the old ceil
+-- the `σ₁·(s−1)` block was forced onto a rank-deficient face the rounder
+-- could not recover.
+example (s : ℝ) (_h : 1 ≤ s) :
+    0 ≤ 704*s^10 - 80*s^9 + 2596*s^8 - 400*s^7 + 2580*s^6 - 560*s^5
+        + 324*s^4 - 240*s^3 - 356*s^2 + 8 := by sos
+
 -- Affine strict-strict goals are discharged by an exact rational LP
 -- fast path, avoiding the SDP search entirely (issue #50).
 example (x a : ℝ) (_h1 : 3*x + 7*a < 4) (_h2 : 3 < 2*x) :

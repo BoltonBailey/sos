@@ -231,9 +231,22 @@ end BasisStrategy
 /-- Half-ceiling: `⌈d/2⌉`. -/
 @[inline] def halfCeil (d : Nat) : Nat := (d + 1) / 2
 
-/-- The basis-degree bound for σᵢ given target degree and gᵢ degree. -/
+/-- The basis-degree bound for σᵢ given target degree and gᵢ degree.
+
+The Putinar relaxation caps `deg(σᵢ·gᵢ) ≤ relaxDeg`, where `relaxDeg =
+2·⌈targetDeg/2⌉` is the even relaxation order. Since `σᵢ` is a sum of
+squares, `deg σᵢ = 2·basisDeg`, so `basisDeg = ⌊(relaxDeg − gDeg)/2⌋`.
+Using `⌈(targetDeg − gDeg)/2⌉` (the old formula) overshoots by one
+whenever `gDeg` is odd and `targetDeg` even (e.g. `targetDeg = 10`,
+`gDeg = 1` gave `5` where `4` is correct): that extra basis degree makes
+`σᵢ·gᵢ` reach `relaxDeg + 1`, whose top coefficient must vanish, forcing
+`σᵢ`'s Gram onto a lower-dimensional face — a rank deficiency that the
+rational rounder cannot recover (the near-zero row/col rounds to a
+non-PSD matrix). Flooring keeps `σᵢ·gᵢ` within `relaxDeg` while still
+covering `targetDeg`. -/
 @[inline] def multiplierBasisDeg (targetDeg : Nat) (gDeg : Nat) : Nat :=
-  if targetDeg < gDeg then 0 else halfCeil (targetDeg - gDeg)
+  let relaxDeg := 2 * halfCeil targetDeg
+  if relaxDeg < gDeg then 0 else (relaxDeg - gDeg) / 2
 
 /-- The cofactor basis-degree bound for an equality polynomial `pⱼ`.
 The cofactor `qⱼ` needs degree headroom up to `σ₀Deg − pⱼ.totalDegree`. -/
@@ -871,10 +884,185 @@ def decodeCofactorBlock (eqSpec : EqCofactorSpec n)
       q := q + CMvPolynomial.monomial eqSpec.basis[b]! coef
   return some q
 
-/-- Try one denominator: round Gram matrices, reconstruct via LDL,
-decode cofactors, build a Certificate, check it. Returns `none` if any
-step fails. -/
-def tryDenominator (gs : List (CMvPolynomial n ℚ))
+/-- Particular solution of `A x = b` over ℚ from an augmented matrix
+(`numVars` variable columns plus a final RHS column), via RREF: read the
+pivot values with every free variable set to zero. Returns `none` only
+when the system is inconsistent. -/
+private def solveParticular (numVars : Nat) (aug : Array (Array ℚ)) :
+    Option (Array ℚ) := Id.run do
+  let R := SOS.RatLinAlg.rref numVars aug
+  if R.inconsistent then return none
+  let mut x : Array ℚ := Array.replicate numVars 0
+  for i in [0:R.rows.size] do
+    let some p := R.pivots[i]? | continue
+    x := x.set! p ((R.rows[i]!)[numVars]!)
+  return some x
+
+/-- Peyrl–Parrilo rational rounding: orthogonally project the rounded
+σ-block Gram matrices `Qs` (upper-triangle flat, one per block) and the
+rounded equality-cofactor coefficient vectors `cofCoeffs` (one per
+`eqSpec`) onto the affine set on which the polynomial identity
+`target = Σ_b σ_b·mult_b + Σⱼ qⱼ·pⱼ` holds *exactly*.
+
+The projection is orthogonal in the Frobenius metric on the Gram blocks
+(diagonal entries weight `1`, off-diagonals weight `2`, cofactor
+coefficients weight `1`), so a strictly-interior CSDP solution suffers
+only a small rational perturbation and stays PSD; and the returned data
+reproduces `target` coefficient-for-coefficient by construction. This is
+what lets a converged-but-irrational CSDP solution round to an *exact*
+rational certificate — naïve entrywise rounding almost never lands on
+the constraint set. Returns `none` if the linear solve degenerates. -/
+private def projectToAffine (target : CMvPolynomial n ℚ)
+    (blocks : Array (BlockSpec n)) (eqSpecs : Array (EqCofactorSpec n))
+    (Qs : Array (Array ℚ)) (cofCoeffs : Array (Array ℚ)) :
+    Option (Array (Array ℚ) × Array (Array ℚ)) := Id.run do
+  -- Variable layout: σ-block upper-tri entries, then cofactor coeffs.
+  let mut gramOffset : Array Nat := #[]
+  let mut nvars : Nat := 0
+  for b in blocks do
+    gramOffset := gramOffset.push nvars
+    nvars := nvars + LDL.upperSize b.size
+  let mut cofOffset : Array Nat := #[]
+  for e in eqSpecs do
+    cofOffset := cofOffset.push nvars
+    nvars := nvars + e.size
+  if nvars = 0 then return some (Qs, cofCoeffs)
+  -- Frobenius metric weights and the flattened rounded solution.
+  let mut w : Array ℚ := Array.replicate nvars 1
+  let mut xRound : Array ℚ := Array.replicate nvars 0
+  for bi in [0:blocks.size] do
+    let block := blocks[bi]!
+    let some Q := Qs[bi]? | return none
+    if Q.size ≠ LDL.upperSize block.size then return none
+    let off := gramOffset[bi]!
+    for i in [0:block.size] do
+      for j in [i:block.size] do
+        let idx := off + LDL.upperIdx block.size i j
+        if i ≠ j then w := w.set! idx 2
+    for t in [0:Q.size] do
+      xRound := xRound.set! (off + t) Q[t]!
+  for ei in [0:eqSpecs.size] do
+    let some c := cofCoeffs[ei]? | return none
+    if c.size ≠ eqSpecs[ei]!.size then return none
+    let off := cofOffset[ei]!
+    for t in [0:c.size] do
+      xRound := xRound.set! (off + t) c[t]!
+  -- Build the dense coefficient-matching system `A x = b`, one row per
+  -- monomial. Seed rows from `target`'s support (RHS = its coefficient),
+  -- then accumulate each block/cofactor product's contribution.
+  let mut monoIndex : Std.TreeMap (CMvMonomial n) Nat compare := {}
+  let mut aRows : Array (Array ℚ) := #[]
+  let mut bvec : Array ℚ := #[]
+  let ensureRow := fun (monoIndex : Std.TreeMap (CMvMonomial n) Nat compare)
+      (aRows : Array (Array ℚ)) (bvec : Array ℚ) (m : CMvMonomial n) =>
+    match monoIndex[m]? with
+    | some r => (monoIndex, aRows, bvec, r)
+    | none =>
+      let r := aRows.size
+      (monoIndex.insert m r, aRows.push (Array.replicate nvars 0),
+        bvec.push (target.coeff m), r)
+  for m in target.monomials do
+    let (mi, ar, bv, _) := ensureRow monoIndex aRows bvec m
+    monoIndex := mi; aRows := ar; bvec := bv
+  for bi in [0:blocks.size] do
+    let block := blocks[bi]!
+    let off := gramOffset[bi]!
+    for i in [0:block.size] do
+      for j in [i:block.size] do
+        let prod := blockProduct block i j
+        let var := off + LDL.upperIdx block.size i j
+        let factor : ℚ := if i = j then 1 else 2
+        for m in prod.monomials do
+          let c := prod.coeff m
+          if c ≠ 0 then
+            let (mi, ar, bv, r) := ensureRow monoIndex aRows bvec m
+            monoIndex := mi; aRows := ar; bvec := bv
+            aRows := aRows.set! r ((aRows[r]!).set! var ((aRows[r]!)[var]! + factor * c))
+  for ei in [0:eqSpecs.size] do
+    let spec := eqSpecs[ei]!
+    let off := cofOffset[ei]!
+    for b in [0:spec.size] do
+      let prod := eqProduct spec b
+      let var := off + b
+      for m in prod.monomials do
+        let c := prod.coeff m
+        if c ≠ 0 then
+          let (mi, ar, bv, r) := ensureRow monoIndex aRows bvec m
+          monoIndex := mi; aRows := ar; bvec := bv
+          aRows := aRows.set! r ((aRows[r]!).set! var ((aRows[r]!)[var]! + c))
+  let numMonos := aRows.size
+  -- Residual `r = b − A x_round`.
+  let mut resid : Array ℚ := Array.mkEmpty numMonos
+  for k in [0:numMonos] do
+    let row := aRows[k]!
+    let mut acc : ℚ := bvec[k]!
+    for v in [0:nvars] do
+      let a := row[v]!
+      if a ≠ 0 then acc := acc - a * xRound[v]!
+    resid := resid.push acc
+  -- Normal-equation matrix `M = A W⁻¹ Aᵀ` (symmetric, PSD).
+  let mut mAug : Array (Array ℚ) := Array.mkEmpty numMonos
+  for k in [0:numMonos] do
+    let rowK := aRows[k]!
+    let mut mRow : Array ℚ := Array.replicate (numMonos + 1) 0
+    for l in [0:numMonos] do
+      let rowL := aRows[l]!
+      let mut s : ℚ := 0
+      for v in [0:nvars] do
+        let a := rowK[v]!
+        if a ≠ 0 then
+          let bb := rowL[v]!
+          if bb ≠ 0 then s := s + a * bb / w[v]!
+      mRow := mRow.set! l s
+    mRow := mRow.set! numMonos resid[k]!
+    mAug := mAug.push mRow
+  let some lam := solveParticular numMonos mAug | return none
+  -- `x_proj = x_round + W⁻¹ Aᵀ λ`.
+  let mut xProj : Array ℚ := xRound
+  for v in [0:nvars] do
+    let mut acc : ℚ := 0
+    for k in [0:numMonos] do
+      let a := (aRows[k]!)[v]!
+      if a ≠ 0 then acc := acc + a * lam[k]!
+    if acc ≠ 0 then xProj := xProj.set! v (xProj[v]! + acc / w[v]!)
+  -- Split back into per-block Gram arrays and cofactor coefficient arrays.
+  let mut Qs' : Array (Array ℚ) := #[]
+  for bi in [0:blocks.size] do
+    let block := blocks[bi]!
+    let off := gramOffset[bi]!
+    Qs' := Qs'.push ((Array.range (LDL.upperSize block.size)).map (fun t => xProj[off + t]!))
+  let mut cofs' : Array (Array ℚ) := #[]
+  for ei in [0:eqSpecs.size] do
+    let spec := eqSpecs[ei]!
+    let off := cofOffset[ei]!
+    cofs' := cofs'.push ((Array.range spec.size).map (fun t => xProj[off + t]!))
+  return some (Qs', cofs')
+
+/-- Build a `Certificate` from per-block Gram arrays and cofactor
+polynomials (via LDL reconstruction) and check it against the goal.
+Returns `none` if any block fails to reconstruct or the check fails. -/
+private def buildAndCheck (gs : List (CMvPolynomial n ℚ))
+    (ps : List (CMvPolynomial n ℚ)) (blocks : Array (BlockSpec n))
+    (gramQs : Array (Array ℚ)) (eqCofs : List (CMvPolynomial n ℚ))
+    (goal : Goal n) : Option (Certificate n) := Id.run do
+  let mut sigmas : Array (List Nat × SOSDecomp n) := Array.mkEmpty blocks.size
+  for blockIdx in [0:blocks.size] do
+    let some block := blocks[blockIdx]? | return none
+    let some Q := gramQs[blockIdx]? | return none
+    let some sigmaTerms :=
+      LDL.reconstruct block.size Q (basisAsPolys block.basis)
+      | return none
+    sigmas := sigmas.push (block.idxs, { terms := sigmaTerms })
+  let cert : Certificate n := { sigmas := sigmas.toList, eqCofs := eqCofs }
+  if cert.checks goal gs ps then return some cert
+  return none
+
+/-- Try one denominator: round the CSDP Gram matrices (and cofactor
+coefficients), Peyrl–Parrilo-project them onto the exact
+coefficient-matching set, reconstruct via LDL, and check the certificate.
+Falls back to the raw (unprojected) rounding when the projection's linear
+solve degenerates. Returns `none` if nothing validates. -/
+def tryDenominator (target : CMvPolynomial n ℚ) (gs : List (CMvPolynomial n ℚ))
     (ps : List (CMvPolynomial n ℚ))
     (blocks : Array (BlockSpec n)) (eqSpecs : Array (EqCofactorSpec n))
     (sol : CSDP.Solution) (denom : ℚ)
@@ -883,29 +1071,40 @@ def tryDenominator (gs : List (CMvPolynomial n ℚ))
   let hasEqs := !ps.isEmpty
   let expectedSize := blocks.size + (if hasEqs then 2 else 0)
   if Qs.size ≠ expectedSize then return none
-  let mut sigmas : Array (List Nat × SOSDecomp n) := Array.mkEmpty blocks.size
-  for blockIdx in [0:blocks.size] do
-    let some block := blocks[blockIdx]? | return none
-    let some Q := Qs[blockIdx]? | return none
-    let some sigmaTerms :=
-      LDL.reconstruct block.size Q (basisAsPolys block.basis)
-      | return none
-    sigmas := sigmas.push (block.idxs, { terms := sigmaTerms })
-  let mut eqCofs : List (CMvPolynomial n ℚ) := []
+  let gramQs : Array (Array ℚ) := Qs.extract 0 blocks.size
+  -- Rounded cofactor coefficients (net `x⁺ − x⁻`), one array per eqSpec.
+  let mut cofCoeffs : Array (Array ℚ) := #[]
   if hasEqs then
     let some xPosDiag := Qs[blocks.size]? | return none
     let some xNegDiag := Qs[blocks.size + 1]? | return none
     let mut offset : Nat := 0
-    let mut acc : Array (CMvPolynomial n ℚ) := #[]
     for spec in eqSpecs do
-      let some q := decodeCofactorBlock spec xPosDiag xNegDiag offset
-        | return none
-      acc := acc.push q
+      let mut coeffs : Array ℚ := Array.mkEmpty spec.size
+      for b in [0:spec.size] do
+        let some xp := xPosDiag[offset + b]? | return none
+        let some xn := xNegDiag[offset + b]? | return none
+        coeffs := coeffs.push (xp - xn)
+      cofCoeffs := cofCoeffs.push coeffs
       offset := offset + spec.size
-    eqCofs := acc.toList
-  let cert : Certificate n :=
-    { sigmas := sigmas.toList, eqCofs := eqCofs }
-  if cert.checks goal gs ps then return some cert
+  -- Turn cofactor coefficient arrays into polynomials `qⱼ = Σ_b c_b · m_b`.
+  let cofsToPolys := fun (cofs : Array (Array ℚ)) => Id.run do
+    let mut acc : Array (CMvPolynomial n ℚ) := #[]
+    for ei in [0:eqSpecs.size] do
+      let spec := eqSpecs[ei]!
+      let coeffs := cofs[ei]!
+      let mut q : CMvPolynomial n ℚ := CMvPolynomial.C 0
+      for b in [0:spec.size] do
+        let c := coeffs[b]!
+        if c ≠ 0 then q := q + CMvPolynomial.monomial spec.basis[b]! c
+      acc := acc.push q
+    return acc.toList
+  -- Primary path: orthogonal projection, then LDL + exact check.
+  if let some (gramQs', cofs') := projectToAffine target blocks eqSpecs gramQs cofCoeffs then
+    if let some cert := buildAndCheck gs ps blocks gramQs' (cofsToPolys cofs') goal then
+      return some cert
+  -- Fallback: raw entrywise rounding (unchanged legacy behaviour).
+  if let some cert := buildAndCheck gs ps blocks gramQs (cofsToPolys cofCoeffs) goal then
+    return some cert
   return none
 
 /-! ### Symmetry-reduced pure SOS path -/
@@ -1794,7 +1993,7 @@ private def tryOneSdp (target : CMvPolynomial n ℚ)
   let maxDenomQ : ℚ := (2 ^ maxRoundingDenomLog2 : ℚ)
   for d in denomCandidates do
     if d ≤ maxDenomQ then
-      if let some cert := tryDenominator gs ps blocks eqSpecs sol d goal then
+      if let some cert := tryDenominator target gs ps blocks eqSpecs sol d goal then
         return some cert
   return none
 
