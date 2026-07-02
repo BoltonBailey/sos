@@ -137,16 +137,14 @@ Two layers, cheapest first:
 
 Empty support means `target = 0`; we conservatively return `false`
 (no σ₀ basis monomial admissible). -/
-def isInHalfNewton (target : CMvPolynomial n ℚ) (m : CMvMonomial n) :
-    Bool := Id.run do
-  let targetMonos : Array (CMvMonomial n) := target.monomials.toArray
+private def pointInNewton (targetMonos : Array (CMvMonomial n))
+    (maxExp : Array Nat) (q : Array Nat) : Bool := Id.run do
   if targetMonos.isEmpty then return false
-  let maxExp := coordwiseMaxSupportExp n targetMonos
   for i in [0:n] do
-    if 2 * m[i]! > maxExp[i]! then return false
+    if q[i]! > maxExp[i]! then return false
   -- Build the equality LP `A λ = b`, λ ≥ 0:
   --   row 0 (normalisation):  Σ λᵢ = 1
-  --   row j+1 (var j):         Σ λᵢ · mᵢ[j] = 2·m[j]
+  --   row j+1 (var j):         Σ λᵢ · mᵢ[j] = q[j]
   let k := targetMonos.size
   let mut A : Array (Array ℚ) := Array.mkEmpty (n + 1)
   let mut b : Array ℚ := Array.mkEmpty (n + 1)
@@ -160,9 +158,14 @@ def isInHalfNewton (target : CMvPolynomial n ℚ) (m : CMvMonomial n) :
       let e : Nat := (targetMonos[i]!)[j]!
       row := row.push (e : ℚ)
     A := A.push row
-    let bj : Nat := 2 * m[j]!
-    b := b.push (bj : ℚ)
+    b := b.push ((q[j]! : ℚ))
   return RatSimplex.isFeasibleEqLP A b
+
+def isInHalfNewton (target : CMvPolynomial n ℚ) (m : CMvMonomial n) :
+    Bool :=
+  let targetMonos : Array (CMvMonomial n) := target.monomials.toArray
+  let maxExp := coordwiseMaxSupportExp n targetMonos
+  pointInNewton targetMonos maxExp ((Array.range n).map (fun i => 2 * m[i]!))
 
 /-- Half-Newton-polytope basis for σ₀: those monomials `m` with
 `totalDegree m ≤ deg` such that `2·exp(m) ∈ Newton(target)`.
@@ -174,6 +177,31 @@ def newtonBasis (target : CMvPolynomial n ℚ) (deg : Nat) :
     Array (CMvMonomial n) :=
   if target.monomials.isEmpty then #[]
   else (monomialsUpTo n deg).filter (fun m => isInHalfNewton target m)
+
+/-- Newton-polytope pruning for a *multiplier* block σ_S with multiplier
+polynomial `g = ∏_{i ∈ S} gᵢ`: keep basis monomial `m` iff
+`2·exp(m) + exp(u) ∈ Newton(target)` for every support monomial `u` of `g`.
+
+Rationale: in a cancellation-free representation `target = Σ_S σ_S·g_S`,
+each product `σ_S·g_S` has Newton polytope inside `Newton(target)`; a
+diagonal Gram entry at `m` contributes the exponents `2·exp(m) + supp(g)`,
+so any `m` violating the test forces its entire Gram row/column to zero —
+a structural rank deficiency that CSDP handles but exact rational
+rounding does not (the near-zero rows round to an indefinite matrix).
+Like the σ₀ half-Newton test this is a heuristic in the Putinar setting
+(cross-block cancellation can defeat it), so callers must keep a `.dense`
+fallback; certificates are verified exactly downstream either way. -/
+def multiplierNewtonBasis (target : CMvPolynomial n ℚ)
+    (g : CMvPolynomial n ℚ) (deg : Nat) : Array (CMvMonomial n) :=
+  if target.monomials.isEmpty then #[]
+  else
+    let targetMonos : Array (CMvMonomial n) := target.monomials.toArray
+    let maxExp := coordwiseMaxSupportExp n targetMonos
+    let gMonos := g.monomials
+    (monomialsUpTo n deg).filter fun m =>
+      gMonos.all fun u =>
+        pointInNewton targetMonos maxExp
+          ((Array.range n).map (fun i => 2 * m[i]! + u[i]!))
 
 /-- Harrison's `newton_polytope` basis order for pure SOS search. It
 enumerates the rectangular per-variable half-degree box, filters by
@@ -345,11 +373,11 @@ basis degree and to every σ_S multiplier basis degree, growing each
 Gram matrix accordingly. `extraDeg = 0` is the original fixed-level
 encoding; iterative-deepening drivers loop `extraDeg = 0, 1, …`.
 
-`strategy` selects the σ₀ basis: `.dense` (complete, default) or
-`.newton` (half-Newton-polytope from Reznick — sound pruning via
-exact-rational LP). The pruning is only applied to σ₀ — product
-multipliers σ_S have no analogous heuristic. The deepening driver is
-responsible for falling back to `.dense` if a pruned attempt fails. -/
+`strategy` selects the bases: `.dense` (complete, default) or
+`.newton` (half-Newton-polytope from Reznick for σ₀, and the shifted
+test `multiplierNewtonBasis` for the product multipliers σ_S — both via
+exact-rational LP). The deepening driver is responsible for falling
+back to `.dense` if a pruned attempt fails. -/
 def buildBlocks (target : CMvPolynomial n ℚ)
     (gs : List (CMvPolynomial n ℚ))
     (ps : List (CMvPolynomial n ℚ) := []) (extraDeg : Nat := 0)
@@ -379,7 +407,9 @@ def buildBlocks (target : CMvPolynomial n ℚ)
                     maxSubsetCardinality gs.toArray
   for (idxs, prod) in products do
     let basisDeg := multiplierBasisDeg σ₀Deg prod.totalDegree + extraDeg
-    let basis := monomialsUpTo n basisDeg
+    let basis := match strategy with
+      | .dense => monomialsUpTo n basisDeg
+      | .newton => multiplierNewtonBasis target prod basisDeg
     let basis := if basis.size == 0 then monomialsUpTo n 0 else basis
     blocks := blocks.push { idxs, basis, multiplier := prod }
   return blocks
@@ -859,6 +889,31 @@ private def unscaleSolution (sol : CSDP.Solution) (xShift : Int) :
       | .sdp n e  => .sdp n (scaleArr e)
       | .diag n e => .diag n (scaleArr e)
     { sol with X := sol.X.map scaleBlock }
+
+/-! ### Guarded CSDP entry point -/
+
+/-- `CSDP.solve` wrapper that refuses to hand CSDP an equality row with no
+`A`-matrix entries. CSDP's native solver does not tolerate a constraint
+whose sparse block list is empty — it walks uninitialised pointers and
+corrupts the process (observed on macOS as a later wild jump through a
+zeroed lazy-binding pointer, i.e. a `SIGSEGV` at address `0` on a
+*subsequent* `CSDP.solve` call).
+
+Empty rows arise when a pruned σ-basis cannot reach a monomial of the
+target: the coefficient-matching equation degenerates to `0 = bᵢ`. If
+`bᵢ ≠ 0` that row makes the SDP trivially infeasible, and if `bᵢ = 0` it
+is vacuous; in both cases the relaxation at this basis has nothing CSDP
+can add, so return `none` and let the driver fall back (e.g. to the
+`.dense` basis). -/
+def solveChecked (problem : CSDP.Problem) : Option CSDP.Solution := Id.run do
+  let k := problem.b.size
+  let mut covered : Array Bool := Array.replicate k false
+  for t in problem.a do
+    let c := t.constraint.toNat
+    if 1 ≤ c ∧ c ≤ k then
+      covered := covered.set! (c - 1) true
+  if covered.any (· = false) then return none
+  return some (CSDP.solve problem)
 
 /-! ### Top-level search driver -/
 
@@ -1355,7 +1410,7 @@ private def tryReducedPureSdp (target : CMvPolynomial n ℚ) (goal : Goal n)
     if cert.checks goal [] [] then return some cert else return none
   let mats := gramMats block.size param
   let problem := buildReducedProblem block.size mats
-  let sol := CSDP.solve problem
+  let some sol := solveChecked problem | return none
   if sol.ret ∉ [0, 3] then
     return none
   let targetDenom : ℚ := (polyDenom target : ℚ)
@@ -1873,7 +1928,7 @@ private def tryReducedSchmudgenSdp (target : CMvPolynomial n ℚ)
   let objScale : Float := if objMax > twoTo20 then twoTo20 / objMax else 1.0
   let problem : CSDP.Problem :=
     { problem with b := problem.b.map (· * objScale) }
-  let sol := CSDP.solve problem
+  let some sol := solveChecked problem | return none
   if sol.ret ∉ [0, 3] then return none
   -- The matrix scaling above is uniform (a single power-of-two `scaleQ`
   -- on every entry), which preserves the feasible set and the argmin, so
@@ -1974,7 +2029,7 @@ private def tryOneSdp (target : CMvPolynomial n ℚ)
   -- and rounds cleanly; we recover `X*` by `unscaleSolution`. See the
   -- "Pre-CSDP matrix conditioning" section above.
   let (problem, xShift) := conditionProblem problem
-  let sol := CSDP.solve problem
+  let some sol := solveChecked problem | return none
   if sol.ret ∉ [0, 3] then
     return none
   let sol := unscaleSolution sol xShift
@@ -2095,22 +2150,38 @@ private def runFeasibilitySearchCore (target : CMvPolynomial n ℚ)
         return some cert
       let basisDeg := halfCeil σ₀Deg + extraDeg
       let fullBasisSize := (monomialsUpTo n basisDeg).size
-      -- Sparsity gate (`4·|support| < C(n+D, D)`): for visibly dense
-      -- targets the pruning is unlikely to shrink the basis enough to
-      -- matter — and small σ₀ blocks (single-monomial bases on a
-      -- target with multiple-monomial supports) can drive CSDP into a
-      -- degenerate SDP that segfaults the FFI. We compute the pruned
-      -- basis only when the gate clears, and additionally require the
-      -- post-dropConstant size to be ≥ 2 and strictly less than dense.
-      -- The `≥ 2` floor is a defence against the CSDP crash on
-      -- pathologically small σ₀ blocks.
+      -- Strategy schedule. Unconstrained goals keep the sparsity gate
+      -- (`4·|support| < C(n+D, D)`): for visibly dense targets the σ₀
+      -- pruning is unlikely to shrink the basis enough to matter — and
+      -- small σ₀ blocks (single-monomial bases on a target with
+      -- multiple-monomial supports) can drive CSDP into a degenerate SDP
+      -- that segfaults the FFI. The `≥ 2` floor below defends against
+      -- that crash in both branches.
+      --
+      -- Constrained goals (`gs ≠ []`) skip the sparsity gate: there the
+      -- Newton pruning is degeneracy *removal*, not a speed knob. A basis
+      -- monomial `m` whose square (shifted by the multiplier support)
+      -- leaves `Newton(target)` has its Gram row forced to zero, so the
+      -- true Gram lies on a face of the PSD cone — CSDP still converges,
+      -- but the rational rounder cannot recover the kernel and every
+      -- denominator fails LDL (e.g. a target of `w`-degree 4 whose dense
+      -- σ-bases carry `w³`/`w⁴` rows). Pruning restores an interior SDP.
       let basisStrategies : List BasisStrategy :=
         if !pruneAllowed then [.dense]
-        else if 4 * supportSize ≥ fullBasisSize then [.dense]
+        else if gs.isEmpty then
+          if 4 * supportSize ≥ fullBasisSize then [.dense]
+          else
+            let pruned := basisStrategy.basisAt target basisDeg
+            let post := if dropConstant then pruned.filter (· ≠ zeroMono n) else pruned
+            if 2 ≤ post.size ∧ post.size < fullBasisSize
+              then [basisStrategy, .dense] else [.dense]
         else
-          let pruned := basisStrategy.basisAt target basisDeg
-          let post := if dropConstant then pruned.filter (· ≠ zeroMono n) else pruned
-          if 2 ≤ post.size ∧ post.size < fullBasisSize
+          let prunedBlocks := buildBlocks target gs ps extraDeg basisStrategy maxCard
+          let denseBlocks := buildBlocks target gs ps extraDeg .dense maxCard
+          let prunedSizes : Array Nat := prunedBlocks.map (·.size)
+          let denseSizes : Array Nat := denseBlocks.map (·.size)
+          let σ₀post : Nat := prunedSizes[0]?.getD 0
+          if 2 ≤ σ₀post ∧ prunedSizes ≠ denseSizes
             then [basisStrategy, .dense] else [.dense]
       for strat in basisStrategies do
         for useTraceCost in costStrategies do
@@ -2301,7 +2372,7 @@ private def runStrictCore (p : CMvPolynomial n ℚ)
     -- block of `sol.X`, so it scales with `X*` and `unscaleSolution`
     -- recovers it in the polynomial scale used to pick rational `ε`.
     let (problem, xShift) := conditionProblem problem
-    let sol := CSDP.solve problem
+    let some sol := solveChecked problem | continue
     if sol.ret ∉ [0, 3] then continue
     let sol := unscaleSolution sol xShift
     let lambdaStar := readLambda sol lambdaBlockIdx
